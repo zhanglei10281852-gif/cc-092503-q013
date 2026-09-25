@@ -97,10 +97,23 @@ class SampleLifecycleService:
         sample = self.samples.get(sample_id)
         sample["events"] = self.samples.events(sample_id)
         sample["children"] = self.samples.children(sample_id)
-        if sample.get("location_sensitivity") != "normal" and not (
-            "*" in principal.permissions or "locations.read_sensitive" in principal.permissions
-        ):
+        exact = "*" in principal.permissions or "locations.read_sensitive" in principal.permissions
+        if sample.get("location_sensitivity") != "normal" and not exact:
             sample["location_code"] = f"MASKED-{sample['location_id']:04d}" if sample.get("location_id") else None
+        active = self.connection.execute(
+            """SELECT t.transfer_code,t.state,t.quantity,t.received_quantity,t.unit,t.expires_at,
+                      t.target_location_id,l.code AS target_location_code,l.sensitivity AS target_sensitivity
+               FROM transfer_orders t JOIN storage_locations l ON l.id=t.target_location_id
+               WHERE t.sample_id=? AND t.state='in_transit' ORDER BY t.id DESC LIMIT 1""",
+            (sample_id,),
+        ).fetchone()
+        sample["active_transfer"] = None
+        if active:
+            active = dict(active)
+            if active["target_sensitivity"] != "normal" and not exact:
+                active["target_location_code"] = f"MASKED-{active['target_location_id']:04d}"
+            del active["target_sensitivity"]
+            sample["active_transfer"] = active
         return sample
 
     def aliquot(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:

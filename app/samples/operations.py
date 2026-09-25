@@ -3,13 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-import uuid
 from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
-from app.samples.repository import ApprovalRepository, LocationRepository, SampleRepository
+from app.samples.repository import ApprovalRepository, SampleRepository
 from app.services.audit import AuditService
 
 
@@ -65,55 +64,6 @@ class CollectionService:
             separators=(",", ":"),
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-class TransferService:
-    def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None):
-        self.connection = connection
-        self.clock = clock or SystemClock()
-        self.samples = SampleRepository(connection)
-        self.locations = LocationRepository(connection)
-        self.audit = AuditService(connection, self.clock)
-
-    def move(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
-        principal.require("samples.write")
-        before = self.samples.get(sample_id)
-        target = self.locations.get(data["location_id"])
-        if before["lifecycle_state"] in {"loaned", "pending_destruction", "destroyed"}:
-            raise ConflictError("当前状态禁止转移保管位置")
-        if before["location_id"] == target["id"]:
-            return {"sample": before, "replayed": True}
-        now = to_storage(self.clock.now())
-        cursor = self.connection.execute(
-            """UPDATE samples SET location_id=?,custody_user_id=?,version=version+1,updated_at=?
-               WHERE id=? AND version=?""",
-            (target["id"], principal.user_id, now, sample_id, data["expected_version"]),
-        )
-        if cursor.rowcount != 1:
-            raise ConflictError("样品位置或版本已变化")
-        after = self.samples.get(sample_id)
-        self.samples.append_event(
-            sample_id,
-            "location.transferred",
-            principal.user_id,
-            now,
-            details={
-                "from_location_id": before["location_id"],
-                "to_location_id": target["id"],
-                "reason": data["reason"],
-            },
-            correlation_id=data.get("correlation_id"),
-        )
-        self.audit.record(
-            principal,
-            "sample.transfer",
-            "sample",
-            str(sample_id),
-            before=before,
-            after=after,
-            metadata={"reason": data["reason"]},
-        )
-        return {"sample": after, "replayed": False}
 
 
 class DestructionService:

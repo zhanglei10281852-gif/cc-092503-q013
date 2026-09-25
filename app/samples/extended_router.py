@@ -10,10 +10,9 @@ from app.samples.extended_schemas import (
     DestructionExecute,
     InventoryCount,
     InventoryStart,
-    TransferCreate,
 )
 from app.samples.inventory import InventoryService, StockSummaryService
-from app.samples.operations import CollectionService, DestructionService, LineageService, TransferService
+from app.samples.operations import CollectionService, DestructionService, LineageService
 from app.samples.reporting import BatchReconciliationService, ExceptionAgingService
 
 router = APIRouter(prefix="/api/sample-operations", tags=["样品作业"])
@@ -23,12 +22,6 @@ router = APIRouter(prefix="/api/sample-operations", tags=["样品作业"])
 def register_collection(payload: CollectionCreate, principal: Principal = Depends(current_principal)):
     with transaction(immediate=True) as connection:
         return CollectionService(connection).register(principal, payload.model_dump())
-
-
-@router.post("/{sample_id}/transfers")
-def transfer_sample(sample_id: int, payload: TransferCreate, principal: Principal = Depends(current_principal)):
-    with transaction(immediate=True) as connection:
-        return TransferService(connection).move(principal, sample_id, payload.model_dump())
 
 
 @router.get("/{sample_id}/lineage")

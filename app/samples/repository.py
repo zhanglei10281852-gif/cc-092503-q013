@@ -74,7 +74,8 @@ class SampleRepository:
     def get(self, sample_id: int) -> dict[str, Any]:
         return row_dict(
             self.connection.execute(
-                """SELECT s.*,b.batch_code,l.code AS location_code,l.sensitivity AS location_sensitivity
+                """SELECT s.*,b.batch_code,l.code AS location_code,l.sensitivity AS location_sensitivity,
+                          (SELECT COUNT(*) FROM transfer_orders t WHERE t.sample_id=s.id AND t.state='in_transit') AS active_transfers
                    FROM samples s JOIN receipt_batches b ON b.id=s.batch_id
                    LEFT JOIN storage_locations l ON l.id=s.location_id WHERE s.id=?""",
                 (sample_id,),
@@ -97,7 +98,8 @@ class SampleRepository:
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(limit)
         rows = self.connection.execute(
-            """SELECT s.*,b.batch_code,l.code AS location_code,l.sensitivity AS location_sensitivity
+            """SELECT s.*,b.batch_code,l.code AS location_code,l.sensitivity AS location_sensitivity,
+                      (SELECT COUNT(*) FROM transfer_orders t WHERE t.sample_id=s.id AND t.state='in_transit') AS active_transfers
                FROM samples s JOIN receipt_batches b ON b.id=s.batch_id
                LEFT JOIN storage_locations l ON l.id=s.location_id""" + where + " ORDER BY s.id DESC LIMIT ?",
             tuple(params),
@@ -144,6 +146,17 @@ class SampleRepository:
 
     def events(self, sample_id: int) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT * FROM sample_events WHERE sample_id=? ORDER BY id", (sample_id,)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = json.loads(item.pop("details_json"))
+            result.append(item)
+        return result
+
+    def events_by_correlation(self, correlation_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM sample_events WHERE correlation_id=? ORDER BY id", (correlation_id,)
+        ).fetchall()
         result = []
         for row in rows:
             item = dict(row)
@@ -228,4 +241,148 @@ class AnomalyRepository:
             rows = self.connection.execute("SELECT * FROM anomaly_cases WHERE state=? ORDER BY id DESC", (state,)).fetchall()
         else:
             rows = self.connection.execute("SELECT * FROM anomaly_cases ORDER BY id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+
+class TransferRepository:
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+
+    def create_order(self, data: dict[str, Any], now: str) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            """INSERT INTO transfer_orders(
+                   transfer_code,sample_id,source_location_id,target_location_id,quantity,received_quantity,unit,
+                   manifest_digest,request_digest,state,frozen_sample_version,source_location_version,initiated_by,
+                   expires_at,created_at,updated_at
+               ) VALUES(?,?,?,?,?,0,?,?,?,'in_transit',?,?,?,?,?,?)""",
+            (
+                data["transfer_code"], data["sample_id"], data.get("source_location_id"), data["target_location_id"],
+                data["quantity"], data["unit"], data["manifest_digest"], data["request_digest"],
+                data["frozen_sample_version"], data["source_location_version"], data["initiated_by"],
+                data["expires_at"], now, now,
+            ),
+        )
+        return self.get_order(cursor.lastrowid)
+
+    def get_order(self, transfer_id: int) -> dict[str, Any]:
+        return row_dict(
+            self.connection.execute(
+                """SELECT t.*,s.sample_code,
+                          sl.code AS source_location_code,sl.sensitivity AS source_location_sensitivity,
+                          tl.code AS target_location_code,tl.sensitivity AS target_location_sensitivity
+                   FROM transfer_orders t
+                   JOIN samples s ON s.id=t.sample_id
+                   LEFT JOIN storage_locations sl ON sl.id=t.source_location_id
+                   JOIN storage_locations tl ON tl.id=t.target_location_id
+                   WHERE t.id=?""",
+                (transfer_id,),
+            ).fetchone()
+        )
+
+    def by_code(self, transfer_code: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM transfer_orders WHERE transfer_code=?", (transfer_code,)).fetchone()
+        return dict(row) if row else None
+
+    def active_for_sample(self, sample_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM transfer_orders WHERE sample_id=? AND state='in_transit' ORDER BY id DESC LIMIT 1",
+            (sample_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def due_orders(self, now: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM transfer_orders WHERE state='in_transit' AND expires_at<=? ORDER BY id", (now,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_orders(self, *, state: str | None = None, sample_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state:
+            clauses.append("t.state=?")
+            params.append(state)
+        if sample_id:
+            clauses.append("t.sample_id=?")
+            params.append(sample_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        rows = self.connection.execute(
+            """SELECT t.*,s.sample_code,
+                      sl.code AS source_location_code,sl.sensitivity AS source_location_sensitivity,
+                      tl.code AS target_location_code,tl.sensitivity AS target_location_sensitivity
+               FROM transfer_orders t
+               JOIN samples s ON s.id=t.sample_id
+               LEFT JOIN storage_locations sl ON sl.id=t.source_location_id
+               JOIN storage_locations tl ON tl.id=t.target_location_id""" + where + " ORDER BY t.id DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def transition(self, transfer_id: int, state: str, now: str, *, return_reason: str | None = None) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            """UPDATE transfer_orders SET state=?,return_reason=COALESCE(?,return_reason),completed_at=?,
+               version=version+1,updated_at=? WHERE id=? AND state='in_transit'""",
+            (state, return_reason, now, now, transfer_id),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("交接单状态已变化，请刷新后重试")
+        return self.get_order(transfer_id)
+
+    def set_progress(self, transfer_id: int, received_quantity: float, now: str) -> None:
+        cursor = self.connection.execute(
+            "UPDATE transfer_orders SET received_quantity=?,version=version+1,updated_at=? WHERE id=? AND state='in_transit'",
+            (received_quantity, now, transfer_id),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("交接单状态已变化，请刷新后重试")
+
+    def add_item(self, transfer_id: int, item: dict[str, Any]) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            "INSERT INTO transfer_items(transfer_id,item_seq,expected_quantity,seal_code) VALUES(?,?,?,?)",
+            (transfer_id, item["item_seq"], item["expected_quantity"], item["seal_code"]),
+        )
+        return dict(self.connection.execute("SELECT * FROM transfer_items WHERE id=?", (cursor.lastrowid,)).fetchone())
+
+    def items(self, transfer_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM transfer_items WHERE transfer_id=? ORDER BY item_seq", (transfer_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def item_by_seq(self, transfer_id: int, item_seq: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM transfer_items WHERE transfer_id=? AND item_seq=?", (transfer_id, item_seq)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def confirm_item(self, item_id: int, confirmed_by: int, now: str) -> None:
+        cursor = self.connection.execute(
+            "UPDATE transfer_items SET state='confirmed',confirmed_by=?,confirmed_at=? WHERE id=? AND state='pending'",
+            (confirmed_by, now, item_id),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("该明细已确认，请勿重复扫描")
+
+    def add_receipt(self, data: dict[str, Any], now: str) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            """INSERT INTO transfer_receipts(transfer_id,item_id,receive_token,confirmed_quantity,seal_code,
+                   target_location_id,confirmed_by,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                data["transfer_id"], data["item_id"], data["receive_token"], data["confirmed_quantity"],
+                data["seal_code"], data["target_location_id"], data["confirmed_by"], data.get("note", ""), now,
+            ),
+        )
+        return dict(self.connection.execute("SELECT * FROM transfer_receipts WHERE id=?", (cursor.lastrowid,)).fetchone())
+
+    def receipt_by_token(self, transfer_id: int, receive_token: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM transfer_receipts WHERE transfer_id=? AND receive_token=?", (transfer_id, receive_token)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def receipts(self, transfer_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM transfer_receipts WHERE transfer_id=? ORDER BY id", (transfer_id,)
+        ).fetchall()
         return [dict(row) for row in rows]

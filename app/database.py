@@ -335,6 +335,59 @@ CREATE TABLE IF NOT EXISTS sample_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sample_events_sample ON sample_events(sample_id, id);
+CREATE INDEX IF NOT EXISTS idx_sample_events_correlation ON sample_events(correlation_id);
+
+CREATE TABLE IF NOT EXISTS transfer_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_code TEXT NOT NULL UNIQUE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    source_location_id INTEGER REFERENCES storage_locations(id),
+    target_location_id INTEGER NOT NULL REFERENCES storage_locations(id),
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    received_quantity REAL NOT NULL DEFAULT 0 CHECK(received_quantity >= 0),
+    unit TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('in_transit','received','returned','cancelled')),
+    return_reason TEXT CHECK(return_reason IN ('rejected','expired')),
+    frozen_sample_version INTEGER NOT NULL,
+    source_location_version INTEGER NOT NULL DEFAULT 0,
+    initiated_by INTEGER NOT NULL REFERENCES users(id),
+    expires_at TEXT NOT NULL,
+    completed_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(received_quantity <= quantity)
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_orders_sample ON transfer_orders(sample_id, state);
+CREATE INDEX IF NOT EXISTS idx_transfer_orders_due ON transfer_orders(state, expires_at);
+
+CREATE TABLE IF NOT EXISTS transfer_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id INTEGER NOT NULL REFERENCES transfer_orders(id) ON DELETE CASCADE,
+    item_seq INTEGER NOT NULL,
+    expected_quantity REAL NOT NULL CHECK(expected_quantity > 0),
+    seal_code TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','confirmed')),
+    confirmed_by INTEGER REFERENCES users(id),
+    confirmed_at TEXT,
+    UNIQUE(transfer_id, item_seq)
+);
+
+CREATE TABLE IF NOT EXISTS transfer_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id INTEGER NOT NULL REFERENCES transfer_orders(id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES transfer_items(id),
+    receive_token TEXT NOT NULL,
+    confirmed_quantity REAL NOT NULL CHECK(confirmed_quantity > 0),
+    seal_code TEXT NOT NULL,
+    target_location_id INTEGER NOT NULL REFERENCES storage_locations(id),
+    confirmed_by INTEGER NOT NULL REFERENCES users(id),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(transfer_id, receive_token)
+);
 """
 
 PERMISSIONS = [

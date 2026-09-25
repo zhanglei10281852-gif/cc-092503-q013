@@ -82,7 +82,7 @@ def test_inventory_reconciles_and_closes(client, admin):
     assert closed.json()["state"] == "closed"
 
 
-def test_transfer_updates_lineage_event(client, admin):
+def test_legacy_one_sided_transfer_endpoint_is_removed(client, admin):
     _, _, sample = _bootstrap_sample(client, admin)
     target = client.post(
         "/api/samples/locations",
@@ -102,7 +102,4 @@ def test_transfer_updates_lineage_event(client, admin):
         headers=admin["headers"],
         json={"location_id": target["id"], "expected_version": sample["version"], "reason": "转入低温保存"},
     )
-    assert moved.status_code == 200, moved.text
-    assert moved.json()["sample"]["location_id"] == target["id"]
-    detail = client.get(f"/api/samples/{sample['id']}", headers=admin["headers"])
-    assert detail.json()["events"][-1]["event_type"] == "location.transferred"
+    assert moved.status_code == 404
