@@ -11,6 +11,7 @@ from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
 from app.samples.repository import AnomalyRepository, ApprovalRepository, BatchRepository, LocationRepository, SampleRepository
+from app.samples.transfers import active_transfer_map, guard_samples_not_in_transit
 from app.services.audit import AuditService
 
 
@@ -87,25 +88,44 @@ class SampleLifecycleService:
         principal.require("samples.read")
         exact = "*" in principal.permissions or "locations.read_sensitive" in principal.permissions
         result = self.samples.list(state=state, batch_id=batch_id)
+        transfers = active_transfer_map(self.connection, [sample["id"] for sample in result])
         for sample in result:
             if sample.get("location_sensitivity") != "normal" and not exact:
                 sample["location_code"] = f"MASKED-{sample['location_id']:04d}" if sample.get("location_id") else None
+            sample["active_transfer"] = self._present_active_transfer(transfers.get(sample["id"]), exact)
         return result
 
     def detail(self, principal: Principal, sample_id: int) -> dict[str, Any]:
         principal.require("samples.read")
+        exact = "*" in principal.permissions or "locations.read_sensitive" in principal.permissions
         sample = self.samples.get(sample_id)
         sample["events"] = self.samples.events(sample_id)
         sample["children"] = self.samples.children(sample_id)
-        if sample.get("location_sensitivity") != "normal" and not (
-            "*" in principal.permissions or "locations.read_sensitive" in principal.permissions
-        ):
+        if sample.get("location_sensitivity") != "normal" and not exact:
             sample["location_code"] = f"MASKED-{sample['location_id']:04d}" if sample.get("location_id") else None
+        transfers = active_transfer_map(self.connection, [sample_id])
+        sample["active_transfer"] = self._present_active_transfer(transfers.get(sample_id), exact)
         return sample
+
+    @staticmethod
+    def _present_active_transfer(active: dict[str, Any] | None, exact: bool) -> dict[str, Any] | None:
+        if active is None:
+            return None
+        target_code = active["target_location_code"]
+        if active.get("target_sensitivity") != "normal" and not exact:
+            target_code = f"MASKED-{active['target_location_id']:04d}"
+        return {
+            "state": "in_transit",
+            "transfer_code": active["transfer_code"],
+            "target_location_id": active["target_location_id"],
+            "target_location_code": target_code,
+            "expires_at": active["expires_at"],
+        }
 
     def aliquot(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.write")
         parent = self.samples.get(sample_id)
+        guard_samples_not_in_transit(self.connection, self.clock, [sample_id])
         total = round(sum(item["quantity"] for item in data["children"]) + data.get("loss_quantity", 0), 9)
         if abs(total - data["requested_quantity"]) > 1e-6:
             raise ValidationError("子样数量与损耗之和必须等于分装数量")
@@ -155,6 +175,7 @@ class SampleLifecycleService:
         ).fetchone()
         if existing:
             return {"record": dict(existing), "sample": self.samples.get(sample_id), "replayed": True}
+        guard_samples_not_in_transit(self.connection, self.clock, [sample_id])
         if sample["quantity"] - sample["reserved_quantity"] < data["quantity"]:
             raise ConflictError("可用数量不足")
         now = to_storage(self.clock.now())
@@ -184,6 +205,7 @@ class LoanService:
         sample = self.samples.get(data["sample_id"])
         if sample["lifecycle_state"] not in {"available", "partially_consumed"}:
             raise ConflictError("样品当前不可借用")
+        guard_samples_not_in_transit(self.connection, self.clock, [data["sample_id"]])
         if sample["quantity"] - sample["reserved_quantity"] < data["quantity"]:
             raise ConflictError("可借数量不足")
         now = to_storage(self.clock.now())

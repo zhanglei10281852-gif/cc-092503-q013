@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 
 from app.api.dependencies import current_principal
 from app.database import get_connection, transaction
@@ -10,11 +10,14 @@ from app.samples.extended_schemas import (
     DestructionExecute,
     InventoryCount,
     InventoryStart,
-    TransferCreate,
+    TransferConfirm,
+    TransferOrderCreate,
+    TransferReject,
 )
 from app.samples.inventory import InventoryService, StockSummaryService
-from app.samples.operations import CollectionService, DestructionService, LineageService, TransferService
+from app.samples.operations import CollectionService, DestructionService, LineageService
 from app.samples.reporting import BatchReconciliationService, ExceptionAgingService
+from app.samples.transfers import TransferService
 
 router = APIRouter(prefix="/api/sample-operations", tags=["样品作业"])
 
@@ -25,10 +28,52 @@ def register_collection(payload: CollectionCreate, principal: Principal = Depend
         return CollectionService(connection).register(principal, payload.model_dump())
 
 
-@router.post("/{sample_id}/transfers")
-def transfer_sample(sample_id: int, payload: TransferCreate, principal: Principal = Depends(current_principal)):
+@router.post("/transfers", status_code=status.HTTP_201_CREATED)
+def create_transfer(payload: TransferOrderCreate, principal: Principal = Depends(current_principal)):
     with transaction(immediate=True) as connection:
-        return TransferService(connection).move(principal, sample_id, payload.model_dump())
+        return TransferService(connection).create(principal, payload.model_dump())
+
+
+@router.get("/transfers")
+def list_transfers(
+    state: str | None = Query(default=None),
+    location_id: int | None = Query(default=None),
+    principal: Principal = Depends(current_principal),
+):
+    with transaction(immediate=True) as connection:
+        return TransferService(connection).list(principal, state, location_id)
+
+
+@router.post("/transfers/expire-due")
+def expire_due_transfers(principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        service = TransferService(connection)
+        expired = service.expire_due(principal)
+        return {"expired_count": len(expired), "transfers": [service.present(principal, order) for order in expired]}
+
+
+@router.get("/transfers/{transfer_id}")
+def get_transfer(transfer_id: int, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return TransferService(connection).get(principal, transfer_id)
+
+
+@router.post("/transfers/{transfer_id}/confirmations")
+def confirm_transfer(transfer_id: int, payload: TransferConfirm, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return TransferService(connection).confirm(principal, transfer_id, payload.model_dump())
+
+
+@router.post("/transfers/{transfer_id}/rejections")
+def reject_transfer(transfer_id: int, payload: TransferReject, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return TransferService(connection).reject(principal, transfer_id, payload.model_dump())
+
+
+@router.post("/transfers/{transfer_id}/cancel")
+def cancel_transfer(transfer_id: int, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return TransferService(connection).cancel(principal, transfer_id)
 
 
 @router.get("/{sample_id}/lineage")

@@ -97,12 +97,31 @@ def test_transfer_updates_lineage_event(client, admin):
             "capacity_units": 50,
         },
     ).json()
-    moved = client.post(
-        f"/api/sample-operations/{sample['id']}/transfers",
+    client.post(
+        "/api/users",
         headers=admin["headers"],
-        json={"location_id": target["id"], "expected_version": sample["version"], "reason": "转入低温保存"},
+        json={"username": "receiver.ops", "password": "Receiver!23456", "display_name": "低温库接收员", "role_codes": ["sample_manager"]},
     )
-    assert moved.status_code == 200, moved.text
-    assert moved.json()["sample"]["location_id"] == target["id"]
+    login = client.post("/api/auth/login", json={"username": "receiver.ops", "password": "Receiver!23456", "client_label": "tests"})
+    receiver_headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    order = client.post(
+        "/api/sample-operations/transfers",
+        headers=admin["headers"],
+        json={"target_location_id": target["id"], "sample_ids": [sample["id"]], "reason": "转入低温保存"},
+    )
+    assert order.status_code == 201, order.text
+    transfer_id = order.json()["transfer"]["id"]
+    # 接收方验收前，全局查询仍显示源位置并标记在途
+    before = client.get(f"/api/samples/{sample['id']}", headers=admin["headers"])
+    assert before.json()["location_id"] != target["id"]
+    assert before.json()["active_transfer"]["state"] == "in_transit"
+    confirmed = client.post(
+        f"/api/sample-operations/transfers/{transfer_id}/confirmations",
+        headers=receiver_headers,
+        json={"items": [{"sample_id": sample["id"], "received_quantity": 20, "seal_code": "SEAL-OPS-1"}]},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["transfer"]["state"] == "completed"
     detail = client.get(f"/api/samples/{sample['id']}", headers=admin["headers"])
-    assert detail.json()["events"][-1]["event_type"] == "location.transferred"
+    assert detail.json()["location_id"] == target["id"]
+    assert detail.json()["events"][-1]["event_type"] == "transfer.received"

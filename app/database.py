@@ -335,6 +335,52 @@ CREATE TABLE IF NOT EXISTS sample_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sample_events_sample ON sample_events(sample_id, id);
+CREATE INDEX IF NOT EXISTS idx_sample_events_correlation ON sample_events(correlation_id);
+
+CREATE TABLE IF NOT EXISTS transfer_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_code TEXT NOT NULL UNIQUE,
+    request_digest TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','completed','partially_received','rejected','cancelled','expired')),
+    initiator_user_id INTEGER NOT NULL REFERENCES users(id),
+    receiver_user_id INTEGER REFERENCES users(id),
+    source_location_id INTEGER NOT NULL REFERENCES storage_locations(id),
+    source_location_version INTEGER NOT NULL,
+    target_location_id INTEGER NOT NULL REFERENCES storage_locations(id),
+    target_location_version INTEGER NOT NULL,
+    item_count INTEGER NOT NULL CHECK(item_count > 0),
+    manifest_json TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    closed_reason TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_orders_pending ON transfer_orders(state, expires_at);
+
+CREATE TABLE IF NOT EXISTS transfer_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id INTEGER NOT NULL REFERENCES transfer_orders(id) ON DELETE CASCADE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    sample_code TEXT NOT NULL,
+    expected_quantity REAL NOT NULL CHECK(expected_quantity >= 0),
+    sample_version INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','received','rejected','returned','cancelled')),
+    received_quantity REAL,
+    seal_code TEXT,
+    confirmed_by INTEGER REFERENCES users(id),
+    confirmed_at TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    anomaly_id INTEGER REFERENCES anomaly_cases(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(transfer_id, sample_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transfer_items_active_sample ON transfer_items(sample_id) WHERE state='pending';
+CREATE INDEX IF NOT EXISTS idx_transfer_items_transfer ON transfer_items(transfer_id);
 """
 
 PERMISSIONS = [

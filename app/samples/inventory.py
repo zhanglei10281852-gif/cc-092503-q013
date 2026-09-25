@@ -10,6 +10,7 @@ from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
 from app.samples.repository import LocationRepository, SampleRepository
+from app.samples.transfers import expire_due_transfers, guard_samples_not_in_transit
 from app.services.audit import AuditService
 
 
@@ -112,7 +113,9 @@ class InventoryRepository:
     def expected_samples(self, location_id: int) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """SELECT * FROM samples WHERE location_id=?
-               AND lifecycle_state NOT IN ('destroyed','consumed') ORDER BY sample_code""",
+               AND lifecycle_state NOT IN ('destroyed','consumed')
+               AND id NOT IN (SELECT sample_id FROM transfer_items WHERE state='pending')
+               ORDER BY sample_code""",
             (location_id,),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -129,6 +132,7 @@ class InventoryService:
 
     def start(self, principal: Principal, location_id: int, session_code: str | None = None) -> dict[str, Any]:
         principal.require("inventory.manage")
+        expire_due_transfers(self.connection, self.clock)
         self.locations.get(location_id)
         if self.inventory.active_for_location(location_id):
             raise ConflictError("该位置已有未结束的盘点")
@@ -168,6 +172,7 @@ class InventoryService:
         sample = self.samples.get(sample_id)
         if sample["location_id"] != session["location_id"]:
             raise ValidationError("样品不属于本次盘点位置")
+        guard_samples_not_in_transit(self.connection, self.clock, [sample_id])
         if observed_present and observed_quantity is None:
             raise ValidationError("发现样品时必须填写实盘数量")
         if observed_quantity is not None and observed_quantity < 0:
@@ -184,6 +189,7 @@ class InventoryService:
 
     def reconcile(self, principal: Principal, session_id: int) -> dict[str, Any]:
         principal.require("inventory.manage")
+        expire_due_transfers(self.connection, self.clock)
         before = self.inventory.get_session(session_id)
         if before["state"] != "counting":
             raise ConflictError("只有计数中的盘点可以生成差异")
@@ -283,8 +289,11 @@ class StockSummaryService:
                       COUNT(s.id) AS sample_count,
                       COALESCE(SUM(CASE WHEN s.lifecycle_state NOT IN ('destroyed','consumed') THEN s.quantity ELSE 0 END),0) AS quantity,
                       SUM(CASE WHEN s.lifecycle_state='loaned' THEN 1 ELSE 0 END) AS loaned_count,
-                      SUM(CASE WHEN s.lifecycle_state='quarantined' THEN 1 ELSE 0 END) AS quarantined_count
-               FROM storage_locations l LEFT JOIN samples s ON s.location_id=l.id
+                      SUM(CASE WHEN s.lifecycle_state='quarantined' THEN 1 ELSE 0 END) AS quarantined_count,
+                      SUM(CASE WHEN ti.id IS NOT NULL THEN 1 ELSE 0 END) AS in_transit_count
+               FROM storage_locations l
+               LEFT JOIN samples s ON s.location_id=l.id
+               LEFT JOIN transfer_items ti ON ti.sample_id=s.id AND ti.state='pending'
                WHERE l.active=1 GROUP BY l.id ORDER BY l.code"""
         ).fetchall()
         result = []

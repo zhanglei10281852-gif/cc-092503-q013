@@ -27,11 +27,34 @@ class CollectionCreate(BaseModel):
     preservation: str = Field(min_length=1, max_length=200)
 
 
-class TransferCreate(BaseModel):
-    location_id: int = Field(gt=0)
-    expected_version: int = Field(gt=0)
+class TransferOrderCreate(BaseModel):
+    transfer_code: str | None = Field(default=None, min_length=3, max_length=64)
+    target_location_id: int = Field(gt=0)
+    receiver_user_id: int | None = Field(default=None, gt=0)
+    sample_ids: list[int] = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=2, max_length=500)
-    correlation_id: str | None = Field(default=None, max_length=100)
+    expires_in_hours: float | None = Field(default=None, gt=0, le=168)
+
+
+class TransferConfirmItem(BaseModel):
+    sample_id: int = Field(gt=0)
+    received_quantity: float = Field(ge=0)
+    seal_code: str = Field(min_length=1, max_length=100)
+    seal_intact: bool = True
+    target_location_id: int | None = Field(default=None, gt=0)
+
+
+class TransferConfirm(BaseModel):
+    items: list[TransferConfirmItem] = Field(min_length=1, max_length=200)
+
+
+class TransferRejectItem(BaseModel):
+    sample_id: int = Field(gt=0)
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class TransferReject(BaseModel):
+    items: list[TransferRejectItem] = Field(min_length=1, max_length=200)
 
 
 class DestructionExecute(BaseModel):
